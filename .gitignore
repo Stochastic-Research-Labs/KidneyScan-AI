@@ -1,0 +1,45 @@
+# KidneyScan AI — files that must NEVER be pushed to GitHub
+# Code + docs + small configs only. Data and trained weights stay local.
+
+# --- Python ---
+.venv/
+.venv-*/
+venv/
+venv-*/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# --- Node / Next.js ---
+node_modules/
+.next/
+dist/
+build/
+out/
+
+# --- Data (KiTS23 is 94.8 GB, CC BY-NC-SA 4.0 — download, do not commit) ---
+data/
+*.nii
+*.nii.gz
+*.npy
+*.npz
+
+# --- Model checkpoints / weights ---
+checkpoints/
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.safetensors
+
+# --- Secrets / local config ---
+.env
+.env.local
+!.env.example
+
+# --- Logs / OS ---
+*.log
+.DS_Store
+Thumbs.db

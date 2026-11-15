@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+# Saved predicted masks served by GET /api/predict/{case_id}/mask.
+# Generated per request; never commit.
+masks_store/
+models_store/*.pt

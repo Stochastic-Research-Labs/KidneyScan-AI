@@ -1,0 +1,28 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Same dark clinical theme as NeuroScan (reused palette, see REUSE.md). */
+:root {
+  --bg-rgb: 7 18 34;
+  --surface-rgb: 10 25 47;
+  --card-rgb: 15 32 53;
+  --border-rgb: 35 55 77;
+  --text-rgb: 239 246 255;
+  --text-muted-rgb: 164 184 207;
+  --primary-rgb: 103 232 249;
+}
+* { border-color: rgb(var(--border-rgb)); }
+html { color-scheme: dark; }
+body {
+  background-color: rgb(var(--bg-rgb));
+  background-image: radial-gradient(ellipse at 80% 0%, rgb(20 70 93 / 0.16), transparent 45rem);
+  color: rgb(var(--text-rgb));
+}
+@layer components {
+  .eyebrow { @apply text-xs font-medium uppercase tracking-[0.18em] text-primary; }
+  .glass-panel { @apply rounded-2xl border border-border bg-card/65 shadow-xl backdrop-blur-xl; }
+  .page-shell { @apply mx-auto w-full max-w-7xl px-5 py-10 sm:px-8 lg:py-14; }
+  .btn-primary { @apply inline-flex min-h-11 items-center justify-center gap-2 rounded-lg bg-primary px-5 text-sm font-semibold text-[#071222] transition hover:opacity-90 disabled:opacity-50; }
+  .btn-ghost { @apply inline-flex min-h-11 items-center justify-center gap-2 rounded-lg border border-border px-5 text-sm font-medium text-text transition hover:text-text hover:border-text-muted disabled:opacity-50; }
+}

@@ -192,8 +192,16 @@ def augment_pair(ct: np.ndarray, mask: np.ndarray):
             mask = np.flip(mask, axis=axis)
     k = rng.randint(0, 4)  # 0, 90, 180, 270 degrees in the H-W plane
     if k:
+        # FIX 2026-11-16 (found in Kaggle Phase 1): a 90/270-degree rot90
+        # swaps H and W, so a 128x128x64 patch becomes 128x64x128 and the
+        # DataLoader collate fails. Resize back to the original patch shape,
+        # same as the zoom step below does.
+        orig_shape = ct.shape
         ct = np.rot90(ct, k, axes=(1, 2))
         mask = np.rot90(mask, k, axes=(1, 2))
+        if ct.shape != orig_shape:
+            ct = resize_to_patch(ct, orig_shape, order=1)
+            mask = resize_to_patch(mask.astype(np.float32), orig_shape, order=0).round()
     zoom = rng.uniform(0.9, 1.1)
     if abs(zoom - 1.0) > 0.01:
         orig_shape = ct.shape

@@ -1,35 +1,25 @@
 import type { Metadata } from "next";
-import Link from "next/link";
+import { Newsreader, Schibsted_Grotesk } from "next/font/google";
+import SiteNav from "../components/SiteNav";
+import SiteFooter from "../components/SiteFooter";
 import "./globals.css";
 
+const display = Newsreader({ subsets: ["latin"], weight: ["300", "400", "500"], style: ["normal", "italic"], variable: "--font-display" });
+const body = Schibsted_Grotesk({ subsets: ["latin"], variable: "--font-body" });
+
 export const metadata: Metadata = {
-  title: "KidneyScan AI — Kidney Tumor + Cyst Segmentation (KiTS23)",
+  title: "KidneyScan AI: kidney tumor and cyst segmentation (KiTS23)",
   description:
-    "Upload a kidney CT (.nii.gz). A light 3D U-Net finds kidney, tumor, and cyst in 3D. Assistive only — a doctor must confirm.",
+    "Upload a kidney CT scan (.nii.gz) and explore the predicted kidney, tumor and cyst in 3D, with volumes in cm³. Research prototype. A doctor must confirm every result.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
-      <body className="flex min-h-screen flex-col font-sans antialiased">
-        <header className="border-b border-border bg-surface/80">
-          <nav className="mx-auto flex w-full max-w-7xl flex-wrap items-center gap-4 px-5 py-4 sm:px-8">
-            <Link href="/" className="text-lg font-bold text-text">
-              KidneyScan <span className="text-primary">AI</span>
-            </Link>
-            <div className="flex gap-5 text-sm text-text-muted">
-              <Link href="/" className="hover:text-text">Home</Link>
-              <Link href="/upload" className="hover:text-text">Upload</Link>
-              <Link href="/viewer" className="hover:text-text">Viewer</Link>
-              <Link href="/results" className="hover:text-text">Results</Link>
-            </div>
-            <p className="ml-auto hidden text-xs text-text-muted sm:block">KiTS23 · Assistive only — a doctor must confirm</p>
-          </nav>
-        </header>
-        <main id="main-content" className="flex-1 w-full">{children}</main>
-        <footer className="border-t border-border px-5 py-6 text-center text-xs text-text-muted">
-          KidneyScan AI · KiTS23 data, CC BY-NC-SA 4.0 · Free for research, not commercial · Not a diagnosis.
-        </footer>
+    <html lang="en" className={`${display.variable} ${body.variable}`}>
+      <body>
+        <SiteNav />
+        <main id="main">{children}</main>
+        <SiteFooter />
       </body>
     </html>
   );

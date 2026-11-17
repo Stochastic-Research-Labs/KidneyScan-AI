@@ -135,6 +135,10 @@ def predict(ct_path: Path, checkpoint_path: Path, device: str = "cpu",
     spacing = tuple(float(s) for s in nii.header.get_zooms()[:3])  # mm
     affine = nii.affine
     original_shape = list(ct.shape)
+    # Keep the raw HU values: the fast path's body crop needs them
+    # (preprocess_ct clips air and tissue alike to 0, so the body
+    # bbox cannot be found after normalisation).
+    ct_raw = ct
     ct = preprocess_ct(ct)
 
     model, meta = load_checkpoint(checkpoint_path, device)
@@ -142,16 +146,27 @@ def predict(ct_path: Path, checkpoint_path: Path, device: str = "cpu",
 
     if fast:
         # Resize whole volume to the training patch, single forward pass.
-        from train import resize_to_patch
-        small = resize_to_patch(ct, train_patch, order=1)
+        # BUT first crop to the central 60% of the body bbox (see
+        # crop_to_body_center in train.py): training only ever saw tight
+        # kidney crops, and the whole-abdomen fast path scored Dice 0.0
+        # on a real case. Validated on 3 real KiTS23 cases (fg Dice
+        # 0.62-0.70 vs 0.0 whole-volume). One forward pass, seconds on CPU.
+        from train import resize_to_patch, crop_to_body_center
+        # Crop the RAW HU volume first (body detection needs HU values),
+        # then normalise the crop exactly as training did.
+        ct_crop_raw, crop_slices = crop_to_body_center(ct_raw)
+        ct_crop = preprocess_ct(ct_crop_raw)
+        small = resize_to_patch(ct_crop, train_patch, order=1)
         with torch.no_grad():
             logits = model(torch.from_numpy(small[None, None]).float()
                            .to(device))[0].cpu().numpy()
         probs = torch.softmax(torch.from_numpy(logits), dim=0).numpy()
-        mask = np.argmax(probs, axis=0).astype(np.uint8)
-        mask = resize_to_patch(mask.astype(np.float32), original_shape,
-                               order=0).round().astype(np.uint8)
-        mask = np.clip(mask, 0, NUM_CLASSES - 1)
+        mask_small = np.argmax(probs, axis=0).astype(np.uint8)
+        mask_crop = resize_to_patch(mask_small.astype(np.float32),
+                                    tuple(int(s) for s in ct_crop.shape),
+                                    order=0).round().astype(np.uint8)
+        mask = np.zeros(original_shape, dtype=np.uint8)
+        mask[crop_slices] = np.clip(mask_crop, 0, NUM_CLASSES - 1)
     else:
         logits = sliding_window_predict(model, ct, train_patch, device)
         probs = torch.softmax(torch.from_numpy(logits), dim=0).numpy()

@@ -44,7 +44,7 @@ MASKS_DIR.mkdir(exist_ok=True)
 CHECKPOINT = MODELS_DIR / "model.pt"
 MODE = os.getenv("KIDNEYSCAN_MODE", "dummy").lower()
 MAX_UPLOAD_BYTES = int(os.getenv("KIDNEYSCAN_MAX_UPLOAD_BYTES", 512 * 1024 * 1024))
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.2"  # 0.1.2: fast inference crops to central 60% of body bbox (Dice 0.0 -> 0.72 on real case)
 
 ASSISTIVE_WARNING = (
     "Assistive tool only. This is not a diagnosis. "
@@ -72,7 +72,12 @@ app = FastAPI(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000",
+                   "https://kidneyscan-ai-research.vercel.app",
+                   # Live site (short URL, chosen 2026-11-16). Without this
+                   # the browser blocks every backend reply and the site
+                   # reports "model server not reachable" — found 2026-11-17.
+                   "https://kidneyscan-ai.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -297,8 +302,13 @@ def real_predict(data: bytes, gt_data: bytes | None = None):
             gt_path = Path(tmp) / "ground_truth.nii.gz"
             gt_path.write_bytes(gt_data)
         try:
+            # fast=True: single resize + forward pass (seconds on 1 CPU).
+            # Sliding window needs 49 forward passes on a full CT and
+            # exceeds Modal's default 300s timeout — verified 2026-11-17:
+            # two real predictions were cancelled/killed mid-run.
+            # fast matches training (whole-volume resize to the patch).
             result, mask, affine = model_inference.predict(
-                ct_path, CHECKPOINT, ground_truth_path=gt_path)
+                ct_path, CHECKPOINT, ground_truth_path=gt_path, fast=True)
         except ImportError as exc:
             # torch / nibabel missing inside the model worker.
             raise HTTPException(

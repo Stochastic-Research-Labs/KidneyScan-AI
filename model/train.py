@@ -137,6 +137,37 @@ def crop_to_mask(ct: np.ndarray, mask: np.ndarray, margin: int = 10):
     return ct[slices], mask[slices]
 
 
+def crop_to_body_center(ct: np.ndarray, frac: float = 0.6,
+                        hu_threshold: float = -500.0):
+    """Crop to the central ``frac`` of the body bounding box (HU > threshold).
+
+    Inference framing fix (2026-11-17): training crops every case to the
+    kidney bbox first (``crop_to_mask``), so the model only ever saw tight
+    kidney close-ups. Feeding it the whole abdomen at inference gave
+    Dice 0.0 on a real case — the kidney was smeared and misplaced.
+    The body bbox (air vs tissue) is computable without any ground
+    truth, and its central 60% contains the kidneys in KiTS23 scans
+    (they are kidney-centred volumes). Validated on 3 real cases with
+    the live checkpoint (fg Dice): case_00009 0.67, case_00030 0.62,
+    case_00038 0.70 — vs 0.0 for the whole-volume fast path and 0.01
+    for the full body bbox. Returns (cropped_volume, slices) so the
+    predicted mask can be placed back into the full volume.
+    """
+    body = ct > hu_threshold
+    if not body.any():
+        slices = tuple(slice(None) for _ in range(ct.ndim))
+        return ct, slices
+    coords = np.argwhere(body)
+    lo, hi = coords.min(axis=0), coords.max(axis=0)
+    cen = (lo + hi) / 2.0
+    half = (hi - lo) * float(frac) / 2.0
+    mins = np.maximum(np.round(cen - half).astype(int), 0)
+    maxs = np.minimum(np.round(cen + half).astype(int),
+                      np.array(ct.shape))
+    slices = tuple(slice(int(a), int(b)) for a, b in zip(mins, maxs))
+    return ct[slices], slices
+
+
 def resize_to_patch(vol: np.ndarray, patch, order: int = 1) -> np.ndarray:
     """Resize a 3D volume to the patch size (simple trilinear/nearest via torch)."""
     vol = np.ascontiguousarray(vol)  # flips/rot90 give negative strides
@@ -156,12 +187,22 @@ class KiTS23Dataset(Dataset):
             layout and the Lite Images/Masks layout.
         patch_size: (D, H, W) patch, e.g. (128, 128, 64).
         augment: apply random flip/rotate/zoom/noise.
+        centred_sampling: with probability ``centred_prob`` take a
+            patch at NATIVE resolution centred on a cyst voxel
+            (cyst first, then tumor, then kidney) instead of
+            resizing the whole volume — see sample_centred_patch().
+            Default False = old whole-volume resize behaviour.
+        centred_prob: probability of a centred patch per case
+            when centred_sampling is on. Default 0.5.
     """
 
-    def __init__(self, cases, patch_size=(128, 128, 64), augment=False):
+    def __init__(self, cases, patch_size=(128, 128, 64), augment=False,
+                 centred_sampling=False, centred_prob=0.5):
         self.cases = [(str(cid), Path(img), Path(msk)) for cid, img, msk in cases]
         self.patch_size = tuple(patch_size)
         self.augment = augment
+        self.centred_sampling = centred_sampling
+        self.centred_prob = float(centred_prob)
 
     def __len__(self):
         return len(self.cases)
@@ -172,15 +213,72 @@ class KiTS23Dataset(Dataset):
         mask, _ = load_nifti(mask_path)
         ct = preprocess_ct(ct)
         ct, mask = crop_to_mask(ct, mask)
-        ct = resize_to_patch(ct, self.patch_size, order=1)
-        mask = resize_to_patch(mask.astype(np.float32), self.patch_size,
-                               order=0).round().astype(np.int64)
+        if self.centred_sampling and np.random.rand() < self.centred_prob:
+            slices = sample_centred_patch(mask, self.patch_size,
+                                          rng=np.random)
+            if slices is not None:
+                # Native-resolution crop: the cyst keeps its real size
+                # (an 8x8x8 cyst stays 512 voxels) instead of shrinking
+                # to ~10 voxels under the whole-volume resize.
+                ct = ct[slices]
+                mask = mask[slices]
+            else:
+                ct = resize_to_patch(ct, self.patch_size, order=1)
+                mask = resize_to_patch(mask.astype(np.float32),
+                                       self.patch_size,
+                                       order=0).round().astype(np.int64)
+        else:
+            ct = resize_to_patch(ct, self.patch_size, order=1)
+            mask = resize_to_patch(mask.astype(np.float32), self.patch_size,
+                                   order=0).round().astype(np.int64)
         mask = np.clip(mask, 0, NUM_CLASSES - 1)
         if self.augment:
             ct, mask = augment_pair(ct, mask)
         x = torch.from_numpy(ct[None].astype(np.float32))
         y = torch.from_numpy(mask.astype(np.int64))
         return x, y
+
+
+def sample_centred_patch(mask: np.ndarray, patch_size,
+                         rng=None, priority_labels=(3, 2, 1)):
+    """Crop window of ``patch_size`` centred on a foreground voxel.
+
+    Cyst-centred sampling (2026-11-16): the old path resizes the
+    WHOLE case to 128x128x64, so an 8x8x8 cyst survives as ~10
+    voxels (2 voxels wide) — too small to learn from. This helper
+    instead returns a window at NATIVE resolution centred on a
+    cyst voxel (label 3 first, then tumor 2, then kidney 1), so
+    the cyst keeps its full size in the patch.
+
+    Args:
+        mask: integer label volume (after crop_to_mask).
+        patch_size: (D, H, W) window, e.g. (128, 128, 64).
+        rng: random source with ``randint(low, high)`` (np.random
+            module or np.random.RandomState). Default: np.random.
+        priority_labels: labels tried in order; the first label
+            present in the mask wins.
+    Returns a tuple of 3 slices, or None when no centred window
+    is possible (volume smaller than the patch in some dim, or
+    no foreground voxel at all) — the caller then falls back to
+    the whole-volume resize path.
+    """
+    if rng is None:
+        rng = np.random
+    patch = tuple(int(p) for p in patch_size)
+    if any(s < p for s, p in zip(mask.shape, patch)):
+        return None
+    for label in priority_labels:
+        coords = np.argwhere(mask == label)
+        if len(coords) == 0:
+            continue
+        centre = coords[rng.randint(0, len(coords))]
+        slices = []
+        for dim in range(3):
+            start = int(centre[dim]) - patch[dim] // 2
+            start = max(0, min(start, mask.shape[dim] - patch[dim]))
+            slices.append(slice(start, start + patch[dim]))
+        return tuple(slices)
+    return None
 
 
 def augment_pair(ct: np.ndarray, mask: np.ndarray):
@@ -269,6 +367,77 @@ def list_cases(data_dir: Path):
                 pairs[stem] = (img, msk)
 
     return [(cid, img, msk) for cid, (img, msk) in sorted(pairs.items())]
+
+
+# ------------------------------------------------------- cyst oversample ---
+
+def find_cyst_cases(cases, cache_file: Path | None = None):
+    """Case ids whose mask contains at least one cyst voxel (label 3).
+
+    Loads each mask once (masks only, not images) and, when a cache
+    file is given, saves {case_id: true/false} as JSON so later runs
+    skip re-reading the masks. A cached entry is trusted as-is; delete
+    the cache file if the masks change. Deterministic: cases are
+    checked in sorted case-id order, cache keys are sorted on write.
+    Returns a set of case ids.
+    """
+    cases = sorted(cases, key=lambda c: c[0])
+    cache = {}
+    if cache_file is not None:
+        cache_file = Path(cache_file)
+        if cache_file.is_file():
+            try:
+                cache = json.loads(cache_file.read_text())
+            except (json.JSONDecodeError, OSError):
+                cache = {}
+    cyst_ids = set()
+    changed = False
+    for cid, _img, msk in cases:
+        if cid in cache:
+            if cache[cid]:
+                cyst_ids.add(cid)
+            continue
+        has_cyst = False
+        try:
+            mask, _ = load_nifti(Path(msk))
+            has_cyst = bool((mask == 3).any())
+        except Exception:  # noqa: BLE001 - unreadable mask: treat as no cyst
+            has_cyst = False
+        cache[cid] = has_cyst
+        changed = True
+        if has_cyst:
+            cyst_ids.add(cid)
+    if cache_file is not None and changed:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps(
+            {k: cache[k] for k in sorted(cache)}, indent=2))
+    return cyst_ids
+
+
+def apply_cyst_oversample(train_cases, repeat: int = 2,
+                          cache_file: Path | None = None, seed: int = 42):
+    """Duplicate cyst-containing cases in the training list.
+
+    Cyst fix (2026-11-16): the dataset resizes the WHOLE case to
+    128x128x64 with no patch sampling, so tiny cysts shrink to a few
+    voxels and most batches contain almost no cyst signal. Duplicating
+    cyst cases (repeat=2 means each cyst case appears twice per epoch)
+    is the simplest fix that fits this whole-volume dataset — no
+    patch sampler to rewrite. Deterministic: cyst ids are found in
+    sorted order, extras are appended in sorted case-id order, and
+    the DataLoader's own shuffle (seeded by the training loop) mixes
+    them. ``seed`` is kept for future shuffling use and recorded in
+    the log line. Returns (new_train_cases, n_cyst_cases).
+    """
+    if repeat < 2:
+        return list(train_cases), 0
+    _ = seed  # ordering is sorted, not random; seed kept for reproducibility
+    cyst_ids = find_cyst_cases(train_cases, cache_file=cache_file)
+    by_id = {c[0]: c for c in train_cases}
+    extras = []
+    for _ in range(repeat - 1):
+        extras.extend(by_id[cid] for cid in sorted(cyst_ids) if cid in by_id)
+    return list(train_cases) + extras, len(cyst_ids)
 
 
 def make_split(cases, phase: str, split_file: Path | None = None):
@@ -367,6 +536,40 @@ def main():
     ap.add_argument("--save-every", type=int, default=10)
     ap.add_argument("--no-amp", action="store_true", help="Disable mixed precision")
     ap.add_argument("--num-workers", type=int, default=2)
+    # Cyst fix flags (2026-11-16; all default OFF so old runs reproduce).
+    ap.add_argument("--cyst-oversample", action="store_true",
+                    help="Duplicate cyst-containing train cases (see "
+                    "--cyst-oversample-repeat). Off by default.")
+    ap.add_argument("--cyst-oversample-repeat", type=int, default=2,
+                    help="Copies of each cyst case per epoch when "
+                    "--cyst-oversample is on. Default: 2.")
+    ap.add_argument("--cyst-cache", type=Path, default=None,
+                    help="JSON cache for cyst presence per case (avoids "
+                    "re-reading masks every run).")
+    ap.add_argument("--cyst-tversky-weight", type=float, default=0.0,
+                    help="Weight of the cyst Tversky loss (FN-heavy, "
+                    "alpha 0.7 / beta 0.3). 0.0 = off (default). "
+                    "Recommended ON value to try first: 1.0.")
+    ap.add_argument("--extra-cyst-dice-weight", type=float, default=0.0,
+                    help="Weight of the extra cyst-only Dice term. "
+                    "0.0 = off (default). Recommended ON value: 1.0. "
+                    "Try one cyst term at a time for a clean ablation.")
+    ap.add_argument("--cap-cyst", type=float, default=10.0,
+                    help="Max class weight for cyst only (tumor stays "
+                    "capped at 5.0). Default: 10.0. Pass 5.0 to restore "
+                    "the old shared cap.")
+    # Cyst-centred patch sampling (2026-11-16; default OFF).
+    ap.add_argument("--cyst-centred-sampling", action="store_true",
+                    help="With probability --cyst-centred-prob, take a "
+                    "native-resolution patch centred on a cyst voxel "
+                    "(cyst first, then tumor, then kidney) instead of "
+                    "resizing the whole volume. Off by default — the "
+                    "old whole-volume resize path is unchanged. "
+                    "Validation always uses the whole-volume path.")
+    ap.add_argument("--cyst-centred-prob", type=float, default=0.5,
+                    help="Probability of a centred patch per training "
+                    "case when --cyst-centred-sampling is on. "
+                    "Default: 0.5. Recommended first try: 0.5.")
     args = ap.parse_args()
 
     if not TORCH_AVAILABLE:
@@ -394,20 +597,46 @@ def main():
     print(f"train={len(train_cases)} val={len(val_cases)}")
 
     # Class weights from the real training data (not the fallback).
-    # Counts voxels on a small sample (first 20 train cases) to keep it fast.
+    # Counts voxels over ALL train cases (not just the first 20):
+    # a 20-case sample can miss cysts almost entirely and give a
+    # wrong cyst weight. Counting is one mask-only pass, still fast.
+    # Counted BEFORE cyst oversampling, so duplicated cyst cases do
+    # not skew the weights (oversampling changes sampling frequency,
+    # not the data distribution the weights describe).
     try:
         counts = np.zeros(NUM_CLASSES, dtype=np.int64)
-        for _case_id, _img_path, mask_path in train_cases[:20]:
+        for _case_id, _img_path, mask_path in train_cases:
             mask, _ = load_nifti(mask_path)
             for c in range(NUM_CLASSES):
                 counts[c] += int((mask == c).sum())
-        weights = compute_class_weights(counts).tolist()
+        weights = compute_class_weights(
+            counts, cap_cyst=args.cap_cyst).tolist()
         print(f"class weights from real data (bg, kidney, tumor, cyst): {weights}")
     except Exception as e:  # noqa: BLE001 - fall back, do not crash training
         print(f"could not count voxels ({e}); using fallback weights")
         weights = DEFAULT_CLASS_WEIGHTS
 
-    train_ds = KiTS23Dataset(train_cases, args.patch_size, augment=True)
+    # Cyst oversampling (opt-in, default off). Duplicates cyst cases in
+    # the training list only — the val split is never touched. Done
+    # AFTER the weight count above, so duplicates do not skew weights.
+    if args.cyst_oversample:
+        n_before = len(train_cases)
+        train_cases, n_cyst = apply_cyst_oversample(
+            train_cases, repeat=args.cyst_oversample_repeat,
+            cache_file=args.cyst_cache, seed=SPLIT_SEED)
+        print(f"cyst oversample x{args.cyst_oversample_repeat}: "
+              f"{n_cyst} cyst cases, train list {n_before} -> "
+              f"{len(train_cases)} entries")
+
+    if args.cyst_centred_sampling:
+        print(f"cyst-centred sampling ON: prob "
+              f"{args.cyst_centred_prob} per train case, native-"
+              f"resolution patch centred on cyst > tumor > kidney; "
+              f"val still uses the whole-volume resize path")
+
+    train_ds = KiTS23Dataset(train_cases, args.patch_size, augment=True,
+                             centred_sampling=args.cyst_centred_sampling,
+                             centred_prob=args.cyst_centred_prob)
     val_ds = KiTS23Dataset(val_cases, args.patch_size, augment=False)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                               shuffle=True, num_workers=args.num_workers)
@@ -417,7 +646,9 @@ def main():
     model = LightUNet3D(base_channels=args.base_channels).to(device)
     print(f"params: {count_parameters(model):,} "
           f"({count_parameters(model) / 1e6:.2f}M)")
-    loss_fn = KidneyLoss(class_weights=weights)
+    loss_fn = KidneyLoss(class_weights=weights,
+                         cyst_tversky_weight=args.cyst_tversky_weight,
+                         extra_cyst_dice_weight=args.extra_cyst_dice_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(

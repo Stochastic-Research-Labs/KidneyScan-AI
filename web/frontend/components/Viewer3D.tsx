@@ -119,7 +119,11 @@ function gridTexture(g: Grid, nearest: boolean) {
 type Panel = ReturnType<typeof makePanel>;
 
 function makePanel(host: HTMLElement, mode: 0 | 1, steps: number) {
-  const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true, powerPreference: "high-performance" });
+  // No powerPreference: asking for "high-performance" makes context
+  // creation fail in headless / software-GL browsers (verified 2026-11-17:
+  // the home hero, which omits it, renders fine in the same browser while
+  // these panels stayed blank). Default preference works everywhere.
+  const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setClearColor(0x000000, 0);
   const canvas = renderer.domElement;
@@ -251,8 +255,17 @@ export default function Viewer3D({ ct, mask, isDummy = false, warning = null }: 
       return;
     }
     const steps = window.innerWidth < 768 ? 160 : 256;
-    const a = makePanel(ctHost.current, 0, steps);
-    const b = makePanel(segHost.current, 1, steps);
+    let a: Panel;
+    let b: Panel;
+    try {
+      a = makePanel(ctHost.current, 0, steps);
+      b = makePanel(segHost.current, 1, steps);
+    } catch {
+      // Renderer could not be created (no usable WebGL): show the
+      // "not available" message instead of silent blank panels.
+      setSupported(false);
+      return;
+    }
     panels.current = { ct: a, seg: b };
 
     // Keep both cameras identical so the two views can be compared directly.

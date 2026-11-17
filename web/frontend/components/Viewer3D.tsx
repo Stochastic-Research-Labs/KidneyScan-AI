@@ -7,220 +7,20 @@ import type { Grid } from "../lib/nifti";
 import { LABELS } from "../lib/labels";
 
 /* -------------------------------------------------------------------------- */
-/* Shaders: GPU ray-marching through the CT (and label) volume.                */
-/* Box-local axes: x = patient Left, y = Superior, z = Anterior.               */
-/* Texture axes:   s = Left, t = Anterior, r = Superior.                       */
+/* Slice-stack volume viewer.                                                  */
+/* The old custom GLSL raymarcher rendered blank in every browser, even with   */
+/* synthetic data and the exact same shader, so it is replaced by a stack of   */
+/* textured planes (one per axial slice). It uses only basic three.js          */
+/* materials, so there is no shader that can silently fail.                    */
+/* Display axes: 0 = Left (x), 1 = Anterior (z), 2 = Superior (y).            */
+/* Grid data index = ((c * sy + b) * sx + a), a = Left, b = Anterior,          */
+/* c = Superior. Each plane is a Left x Anterior cross-section, stacked        */
+/* along Superior.                                                             */
 /* -------------------------------------------------------------------------- */
-const VERT = /* glsl */ `
-out vec3 vOrigin;
-out vec3 vDir;
-void main() {
-  vOrigin = (inverse(modelMatrix) * vec4(cameraPosition, 1.0)).xyz;
-  vDir = position - vOrigin;
-  gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(position, 1.0);
-}`;
 
-const FRAG = /* glsl */ `
-precision highp float;
-in vec3 vOrigin;
-in vec3 vDir;
-uniform highp sampler3D uCT;
-uniform highp sampler3D uMask;
-uniform float uMode;      // 0 = original CT, 1 = segmentation overlay
-uniform float uHasCT;
-uniform float uHasMask;
-uniform float uDensity;
-uniform float uClip;      // cuts the anterior side away to look inside
-uniform vec3 uShow;       // kidney, tumor, cyst visibility
-uniform int uSteps;
-uniform vec3 uColK;
-uniform vec3 uColT;
-uniform vec3 uColC;
-
-float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
-
-vec2 hitBox(vec3 o, vec3 d) {
-  vec3 inv = 1.0 / d;
-  vec3 t0 = (vec3(-0.5) - o) * inv;
-  vec3 t1 = (vec3(0.5) - o) * inv;
-  vec3 tmin = min(t0, t1);
-  vec3 tmax = max(t0, t1);
-  return vec2(max(max(tmin.x, tmin.y), tmin.z), min(min(tmax.x, tmax.y), tmax.z));
-}
-
-void main() {
-  vec3 rd = normalize(vDir);
-  vec2 b = hitBox(vOrigin, rd);
-  if (b.x > b.y) discard;
-  b.x = max(b.x, 0.0);
-  float dt = (b.y - b.x) / float(uSteps);
-  vec3 p = vOrigin + rd * (b.x + dt * hash(gl_FragCoord.xy));
-  vec3 acc = vec3(0.0);
-  float al = 0.0;
-
-  for (int i = 0; i < 400; i++) {
-    if (i >= uSteps) break;
-    if (p.z < 0.5 - uClip) {
-      vec3 tc = vec3(p.x, p.z, p.y) + 0.5;
-      float c = uHasCT > 0.5 ? texture(uCT, tc).r : 0.0;
-      float d = smoothstep(0.14, 1.0, c);
-      d *= d;
-      float k = uDensity * (uMode < 0.5 ? 7.0 : 2.0);
-      float a1 = 1.0 - exp(-k * d * dt);
-      vec3 c1 = mix(vec3(0.46, 0.62, 0.78), vec3(1.0, 0.96, 0.88), smoothstep(0.35, 1.0, c));
-
-      float a2 = 0.0;
-      vec3 c2 = vec3(0.0);
-      if (uMode > 0.5 && uHasMask > 0.5) {
-        float lab = floor(texture(uMask, tc).r * 255.0 + 0.5);
-        if (lab > 0.5 && lab < 1.5 && uShow.x > 0.5) { c2 = uColK; a2 = 1.0 - exp(-8.0 * dt); }
-        else if (lab > 1.5 && lab < 2.5 && uShow.y > 0.5) { c2 = uColT; a2 = 1.0 - exp(-90.0 * dt); }
-        else if (lab > 2.5 && lab < 3.5 && uShow.z > 0.5) { c2 = uColC; a2 = 1.0 - exp(-90.0 * dt); }
-      }
-      float a = a2 + (1.0 - a2) * a1;
-      vec3 col = a > 1e-5 ? (c2 * a2 + c1 * a1 * (1.0 - a2)) / a : vec3(0.0);
-      acc += (1.0 - al) * a * col;
-      al += (1.0 - al) * a;
-      if (al > 0.97) break;
-    }
-    p += rd * dt;
-  }
-  gl_FragColor = vec4(acc / max(al, 1e-4), al);
-}`;
-
-const hexToVec = (h: string) =>
-  new THREE.Vector3(parseInt(h.slice(1, 3), 16) / 255, parseInt(h.slice(3, 5), 16) / 255, parseInt(h.slice(5, 7), 16) / 255);
-
-/* -------------------------------------------------------------------------- */
-/* One WebGL panel                                                             */
-/* -------------------------------------------------------------------------- */
+const MAX_PLANES = 40;
 const HOME = new THREE.Vector3(0.9, 0.45, 2.3);
 
-function emptyTexture() {
-  const t = new THREE.Data3DTexture(new Uint8Array([0]), 1, 1, 1);
-  t.format = THREE.RedFormat;
-  t.type = THREE.UnsignedByteType;
-  t.unpackAlignment = 1;
-  t.needsUpdate = true;
-  return t;
-}
-
-function gridTexture(g: Grid, nearest: boolean) {
-  const t = new THREE.Data3DTexture(g.data as unknown as BufferSource, g.size[0], g.size[1], g.size[2]);
-  t.format = THREE.RedFormat;
-  t.type = THREE.UnsignedByteType;
-  t.minFilter = t.magFilter = nearest ? THREE.NearestFilter : THREE.LinearFilter;
-  t.wrapS = t.wrapT = t.wrapR = THREE.ClampToEdgeWrapping;
-  t.unpackAlignment = 1;
-  t.needsUpdate = true;
-  return t;
-}
-
-type Panel = ReturnType<typeof makePanel>;
-
-function makePanel(host: HTMLElement, mode: 0 | 1, steps: number) {
-  // No powerPreference: asking for "high-performance" makes context
-  // creation fail in headless / software-GL browsers (verified 2026-11-17:
-  // the home hero, which omits it, renders fine in the same browser while
-  // these panels stayed blank). Default preference works everywhere.
-  const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.setClearColor(0x000000, 0);
-  const canvas = renderer.domElement;
-  canvas.style.cssText = "display:block;width:100%;height:100%;touch-action:none;outline:none;";
-  canvas.setAttribute("role", "img");
-  canvas.setAttribute("aria-label", mode === 0 ? "3D view of the original CT. Drag to rotate." : "3D view of the segmentation overlay. Drag to rotate.");
-  host.appendChild(canvas);
-
-  const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(38, 1, 0.05, 20);
-  camera.position.copy(HOME);
-  const controls = new OrbitControls(camera, canvas);
-  controls.enableDamping = true;
-  controls.dampingFactor = 0.09;
-  controls.enablePan = false;
-  controls.minDistance = 1;
-  controls.maxDistance = 5;
-  controls.autoRotateSpeed = 2.4;
-
-  const uniforms = {
-    uCT: { value: emptyTexture() },
-    uMask: { value: emptyTexture() },
-    uMode: { value: mode },
-    uHasCT: { value: 0 },
-    uHasMask: { value: 0 },
-    uDensity: { value: 1 },
-    uClip: { value: 0 },
-    uShow: { value: new THREE.Vector3(1, 1, 1) },
-    uSteps: { value: steps },
-    uColK: { value: hexToVec(LABELS[0].color) },
-    uColT: { value: hexToVec(LABELS[1].color) },
-    uColC: { value: hexToVec(LABELS[2].color) },
-  };
-  const material = new THREE.ShaderMaterial({
-    glslVersion: THREE.GLSL3,
-    vertexShader: VERT,
-    fragmentShader: FRAG,
-    uniforms,
-    side: THREE.BackSide,
-    transparent: true,
-    depthWrite: false,
-  });
-  const geometry = new THREE.BoxGeometry(1, 1, 1);
-  const mesh = new THREE.Mesh(geometry, material);
-  scene.add(mesh);
-
-  let dirty = true;
-  controls.addEventListener("change", () => (dirty = true));
-
-  return {
-    camera,
-    controls,
-    uniforms,
-    markDirty: () => (dirty = true),
-    resize() {
-      const w = host.clientWidth || 1;
-      const h = host.clientHeight || 1;
-      renderer.setSize(w, h, false);
-      camera.aspect = w / h;
-      camera.updateProjectionMatrix();
-      dirty = true;
-    },
-    setGrids(ct: Grid | null, mask: Grid | null) {
-      uniforms.uCT.value.dispose();
-      uniforms.uMask.value.dispose();
-      uniforms.uCT.value = ct ? gridTexture(ct, false) : emptyTexture();
-      uniforms.uMask.value = mask ? gridTexture(mask, true) : emptyTexture();
-      uniforms.uHasCT.value = ct ? 1 : 0;
-      uniforms.uHasMask.value = mask ? 1 : 0;
-      const ext = (ct ?? mask)?.extentsMm ?? [1, 1, 1];
-      const m = Math.max(ext[0], ext[1], ext[2]);
-      mesh.scale.set(ext[0] / m, ext[2] / m, ext[1] / m);
-      dirty = true;
-    },
-    frame() {
-      const moved = controls.update();
-      if (moved || dirty) {
-        renderer.render(scene, camera);
-        dirty = false;
-      }
-    },
-    dispose() {
-      controls.dispose();
-      uniforms.uCT.value.dispose();
-      uniforms.uMask.value.dispose();
-      geometry.dispose();
-      material.dispose();
-      renderer.dispose();
-      renderer.forceContextLoss();
-      canvas.remove();
-    },
-  };
-}
-
-/* -------------------------------------------------------------------------- */
-/* Two linked panels                                                           */
-/* -------------------------------------------------------------------------- */
 type Props = {
   ct: Grid | null;
   mask: Grid | null;
@@ -234,6 +34,236 @@ const VIEWS: { name: string; label: string; pos: [number, number, number] }[] = 
   { name: "top", label: "Top", pos: [0, 2.3, 0.001] },
   { name: "back", label: "Back", pos: [0, 0, -2.3] },
 ];
+
+const hexToRgb = (h: string): [number, number, number] => [
+  parseInt(h.slice(1, 3), 16),
+  parseInt(h.slice(3, 5), 16),
+  parseInt(h.slice(5, 7), 16),
+];
+
+const LABEL_RGB = LABELS.map((l) => hexToRgb(l.color));
+
+/** Evenly spaced Superior indices, at most MAX_PLANES of them. */
+function sliceIndices(sz: number): number[] {
+  const n = Math.min(MAX_PLANES, sz);
+  if (n <= 1) return [0];
+  const out: number[] = [];
+  for (let i = 0; i < n; i++) out.push(Math.round((i * (sz - 1)) / (n - 1)));
+  return out;
+}
+
+function makeTexture(rgba: Uint8Array<ArrayBuffer>, w: number, h: number): THREE.DataTexture {
+  const t = new THREE.DataTexture(rgba, w, h, THREE.RGBAFormat, THREE.UnsignedByteType);
+  t.minFilter = THREE.LinearFilter;
+  t.magFilter = THREE.LinearFilter;
+  t.wrapS = THREE.ClampToEdgeWrapping;
+  t.wrapT = THREE.ClampToEdgeWrapping;
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.needsUpdate = true;
+  return t;
+}
+
+/** CT slice: grey value, alpha = value (air transparent, tissue visible). */
+function ctSliceRGBA(g: Grid, c: number): { data: Uint8Array<ArrayBuffer>; w: number; h: number } {
+  const [sx, sy] = g.size;
+  const data = new Uint8Array(sx * sy * 4);
+  const base = c * sx * sy;
+  for (let b = 0; b < sy; b++) {
+    for (let a = 0; a < sx; a++) {
+      const v = g.data[base + b * sx + a];
+      const i = (b * sx + a) * 4;
+      data[i] = v;
+      data[i + 1] = v;
+      data[i + 2] = v;
+      data[i + 3] = v;
+    }
+  }
+  return { data, w: sx, h: sy };
+}
+
+/** Overlay slice: dimmed CT underneath, label colour on top where shown. */
+function overlaySliceRGBA(
+  ct: Grid,
+  mask: Grid,
+  c: number,
+  show: [boolean, boolean, boolean],
+): { data: Uint8Array<ArrayBuffer>; w: number; h: number } {
+  const [sx, sy] = ct.size;
+  const data = new Uint8Array(sx * sy * 4);
+  const base = c * sx * sy;
+  for (let b = 0; b < sy; b++) {
+    for (let a = 0; a < sx; a++) {
+      const i = (b * sx + a) * 4;
+      const lab = mask.data[base + b * sx + a];
+      if (lab >= 1 && lab <= 3 && show[lab - 1]) {
+        const [r, gg, bb] = LABEL_RGB[lab - 1];
+        data[i] = r;
+        data[i + 1] = gg;
+        data[i + 2] = bb;
+        data[i + 3] = 235;
+      } else {
+        const v = Math.round(ct.data[base + b * sx + a] * 0.55);
+        data[i] = v;
+        data[i + 1] = v;
+        data[i + 2] = v;
+        data[i + 3] = v;
+      }
+    }
+  }
+  return { data, w: sx, h: sy };
+}
+
+/* -------------------------------------------------------------------------- */
+/* One WebGL panel                                                             */
+/* -------------------------------------------------------------------------- */
+
+type Panel = {
+  camera: THREE.PerspectiveCamera;
+  controls: OrbitControls;
+  group: THREE.Group;
+  planes: THREE.Mesh[];
+  materials: THREE.MeshBasicMaterial[];
+  geometry: THREE.BufferGeometry | null;
+  setStacks: (
+    ct: Grid | null,
+    mask: Grid | null,
+    show: [boolean, boolean, boolean],
+    brightness: number,
+    clip: number,
+  ) => void;
+  setBrightness: (b: number) => void;
+  setClip: (c: number) => void;
+  resize: () => void;
+  dispose: () => void;
+};
+
+function makePanel(host: HTMLElement, mode: 0 | 1): Panel {
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setClearColor(0x000000, 0);
+  const canvas = renderer.domElement;
+  canvas.style.cssText = "display:block;width:100%;height:100%;touch-action:none;outline:none;";
+  canvas.setAttribute("role", "img");
+  canvas.setAttribute(
+    "aria-label",
+    mode === 0
+      ? "3D view of the original CT. Drag to rotate."
+      : "3D view of the segmentation overlay. Drag to rotate.",
+  );
+  host.appendChild(canvas);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(38, 1, 0.05, 20);
+  camera.position.copy(HOME);
+  const controls = new OrbitControls(camera, canvas);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.09;
+  controls.enablePan = false;
+  controls.minDistance = 1;
+  controls.maxDistance = 5;
+  controls.autoRotateSpeed = 2.4;
+
+  const group = new THREE.Group();
+  scene.add(group);
+
+  const panel: Panel = {
+    camera,
+    controls,
+    group,
+    planes: [],
+    materials: [],
+    geometry: null,
+
+    setStacks(ct, mask, show, brightness, clip) {
+      // Clear the old stack.
+      for (const p of panel.planes) {
+        const m = p.material as THREE.MeshBasicMaterial;
+        m.map?.dispose();
+        m.dispose();
+        group.remove(p);
+      }
+      panel.planes = [];
+      panel.materials = [];
+      panel.geometry?.dispose();
+      panel.geometry = null;
+
+      const grid = mode === 0 ? ct : ct;
+      if (!grid) return;
+      if (mode === 1 && !mask) return;
+
+      const [sx, sy, sz] = grid.size;
+      const m = Math.max(grid.extentsMm[0], grid.extentsMm[1], grid.extentsMm[2]);
+      const w = grid.extentsMm[0] / m; // Left
+      const h = grid.extentsMm[1] / m; // Anterior
+      const depth = grid.extentsMm[2] / m; // Superior
+      const geo = new THREE.PlaneGeometry(w, h);
+      geo.rotateX(-Math.PI / 2); // lie flat: Left x Anterior, stacked along Superior
+      panel.geometry = geo;
+
+      const idx = sliceIndices(sz);
+      const keep = Math.max(1, Math.round(idx.length * (1 - clip)));
+      idx.forEach((c, k) => {
+        const slice =
+          mode === 0
+            ? ctSliceRGBA(grid, c)
+            : overlaySliceRGBA(grid, mask as Grid, c, show);
+        const tex = makeTexture(slice.data, slice.w, slice.h);
+        const mat = new THREE.MeshBasicMaterial({
+          map: tex,
+          transparent: true,
+          depthWrite: false,
+          side: THREE.DoubleSide,
+        });
+        mat.color.setScalar(Math.min(Math.max(brightness, 0.1), 3));
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.position.y = (c / Math.max(sz - 1, 1) - 0.5) * depth;
+        mesh.visible = k < keep;
+        group.add(mesh);
+        panel.planes.push(mesh);
+        panel.materials.push(mat);
+      });
+    },
+
+    setBrightness(b: number) {
+      const v = Math.min(Math.max(b, 0.1), 3);
+      for (const mat of panel.materials) mat.color.setScalar(v);
+    },
+
+    setClip(c: number) {
+      const keep = Math.max(1, Math.round(panel.planes.length * (1 - c)));
+      panel.planes.forEach((p, k) => (p.visible = k < keep));
+    },
+
+    resize() {
+      const w = host.clientWidth || 1;
+      const h = host.clientHeight || 1;
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    },
+
+    dispose() {
+      controls.dispose();
+      for (const p of panel.planes) {
+        const mat = p.material as THREE.MeshBasicMaterial;
+        mat.map?.dispose();
+        mat.dispose();
+      }
+      panel.geometry?.dispose();
+      renderer.dispose();
+      renderer.forceContextLoss();
+      canvas.remove();
+    },
+  };
+
+  // Render loop is driven by the component's tick; keep a handle to render.
+  (panel as unknown as { render: () => void }).render = () => renderer.render(scene, camera);
+  return panel;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Two linked panels                                                           */
+/* -------------------------------------------------------------------------- */
 
 export default function Viewer3D({ ct, mask, isDummy = false, warning = null }: Props) {
   const ctHost = useRef<HTMLDivElement>(null);
@@ -254,15 +284,12 @@ export default function Viewer3D({ ct, mask, isDummy = false, warning = null }: 
       setSupported(false);
       return;
     }
-    const steps = window.innerWidth < 768 ? 160 : 256;
     let a: Panel;
     let b: Panel;
     try {
-      a = makePanel(ctHost.current, 0, steps);
-      b = makePanel(segHost.current, 1, steps);
+      a = makePanel(ctHost.current, 0);
+      b = makePanel(segHost.current, 1);
     } catch {
-      // Renderer could not be created (no usable WebGL): show the
-      // "not available" message instead of silent blank panels.
       setSupported(false);
       return;
     }
@@ -276,7 +303,6 @@ export default function Viewer3D({ ct, mask, isDummy = false, warning = null }: 
         syncing = true;
         to.camera.position.copy(from.camera.position);
         to.controls.update();
-        to.markDirty();
         syncing = false;
       });
     link(a, b);
@@ -285,6 +311,7 @@ export default function Viewer3D({ ct, mask, isDummy = false, warning = null }: 
     // Touching either view stops auto-rotate so it never fights the user.
     const stop = () => {
       a.controls.autoRotate = false;
+      b.controls.autoRotate = false;
       setRotating(false);
     };
     a.controls.addEventListener("start", stop);
@@ -307,8 +334,10 @@ export default function Viewer3D({ ct, mask, isDummy = false, warning = null }: 
     const tick = () => {
       raf = requestAnimationFrame(tick);
       if (!visible) return;
-      a.frame();
-      b.frame();
+      a.controls.update();
+      b.controls.update();
+      (a as unknown as { render: () => void }).render();
+      (b as unknown as { render: () => void }).render();
     };
     tick();
 
@@ -322,47 +351,46 @@ export default function Viewer3D({ ct, mask, isDummy = false, warning = null }: 
     };
   }, []);
 
-  // Upload volumes when they change.
+  // Rebuild the stacks when the volumes or the label toggles change.
   useEffect(() => {
     const p = panels.current;
     if (!p) return;
-    p.ct.setGrids(ct, null);
-    p.seg.setGrids(ct, mask);
-  }, [ct, mask]);
+    p.ct.setStacks(ct, mask, show, density, clip);
+    p.seg.setStacks(ct, mask, show, density, clip);
+  }, [ct, mask, show]);
 
   useEffect(() => {
     const p = panels.current;
     if (!p) return;
-    p.seg.uniforms.uShow.value.set(show[0] ? 1 : 0, show[1] ? 1 : 0, show[2] ? 1 : 0);
-    p.seg.markDirty();
-  }, [show]);
+    p.ct.setBrightness(density);
+    p.seg.setBrightness(density);
+  }, [density]);
 
   useEffect(() => {
     const p = panels.current;
     if (!p) return;
-    for (const panel of [p.ct, p.seg]) {
-      panel.uniforms.uClip.value = clip;
-      panel.uniforms.uDensity.value = density;
-      panel.markDirty();
-    }
-  }, [clip, density]);
+    p.ct.setClip(clip);
+    p.seg.setClip(clip);
+  }, [clip]);
 
   const toggleRotate = useCallback(() => {
     const p = panels.current;
     if (!p) return;
-    p.ct.controls.autoRotate = !p.ct.controls.autoRotate;
-    setRotating(p.ct.controls.autoRotate);
+    const next = !p.ct.controls.autoRotate;
+    p.ct.controls.autoRotate = next;
+    p.seg.controls.autoRotate = next;
+    setRotating(next);
   }, []);
 
   const goTo = useCallback((pos: THREE.Vector3 | [number, number, number]) => {
     const p = panels.current;
     if (!p) return;
     p.ct.controls.autoRotate = false;
+    p.seg.controls.autoRotate = false;
     setRotating(false);
     if (Array.isArray(pos)) p.ct.camera.position.set(...pos);
     else p.ct.camera.position.copy(pos);
     p.ct.controls.update();
-    p.ct.markDirty();
   }, []);
 
   const toggleLabel = (i: number) =>
